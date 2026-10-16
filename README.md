@@ -1,100 +1,106 @@
-# Network Port Scanner (v1.2)
+# 🛡️ Network Port Scanner
 
-A lightweight, zero-dependency TCP port scanner written in pure Python. Designed for predictable execution, clear state classification (`open`, `closed`, `no_response`), and low-impact network verification.
+A dependency-free TCP port scanner built incrementally, with a focus on
+correctness, operator safety, and explicit consent before scanning anything.
 
----
+## ✨ Features ✨
 
-## 🎯 Operational Use Cases
+- 🐍 **Zero third-party dependencies** — Python standard library only, runs
+  anywhere `python3` runs.
+- 🎯 **Honest port states** — every port is reported as `open`, `closed`
+  (actively refused) or `no_response` (timeout), never a plain `True/False`.
+- ⚡ **Concurrent scanning** — `ThreadPoolExecutor`-based, with a validated
+  worker limit (`-w/--workers`, 1-100) to avoid exhausting file descriptors.
+- 🍃 **Gentle mode** (`--gentle`) — automatically caps workers at 3 and raises
+  the timeout, for scanning sensitive environments with less network noise.
+- 🛡️ **Explicit authorization check** — asks for confirmation before sending
+  any packet, unless `-y/--yes` is passed.
+- 📂 **Flexible port selection** — a custom list/range (`-p`), or a built-in
+  profile (`--top-100`, `--top-1000`).
+- 📊 **Optional export** — JSON (default) or CSV (`--csv`), written to disk
+  only when `-o/--output` is explicitly given. Nothing is saved by default.
+- 💬 **Interactive fallback** — if `-t/--target` is omitted, the scanner just
+  asks for it instead of crashing.
 
-* **🔴 Red Team / Pentesting (Living off the Land):** Runs entirely on Python's standard library (`socket`, `concurrent.futures`, `errno`, `json`). Can be deployed on restricted pivot hosts without installing external packages or requiring root/`sudo` privileges.
-* **🟣 Purple Team (Detection & SIEM Calibration):** Generates a unique `Run ID` and strict `UTC Timestamp` on every execution, making it trivial to correlate scan activity against firewall logs, WAF alerts, and SIEM events. Compare standard concurrency against `--gentle` mode to test rate-limiting thresholds.
-* **🔵 Blue Team / SecOps (Safe Surface Auditing):** Distinguishes between actively refused connections (`closed` / `ECONNREFUSED`) and firewall drops (`no_response` / timeout). Includes a confirmation prompt, `--gentle` mode for production-safe checks, and structured JSON export for baseline diffing.
+## 📋 Requirements
 
----
+- 🐍 Python 3.8+ — no `pip install` needed.
 
-## ✨ Key Features (v1.2)
+## 🚀 Usage
 
-* **Zero External Dependencies:** Uses only Python 3 standard libraries.
-* **Three-State Port Classification:** Accurately separates `open`, `closed` (host active, port refused), and `no_response` (filtered/timeout).
-* **Bounded Concurrency:** Powered by `ThreadPoolExecutor` with configurable worker limits (`1-100`) and deterministic output ordering.
-* **Low-Impact Mode (`--gentle`):** Automatically caps concurrency to `3 workers` and enforces a minimum `2.0s` timeout to avoid stressing fragile or production services.
-* **Flexible Target & Port Parsing:** Accepts bare IPs, domains, or full URLs, plus individual ports and ranges (e.g., `22,80,443,8000-8010`).
-* **Privacy by Default:** No telemetry or automatic disk writes. Reports are only saved when explicitly requested via `-o / --output`.
-
----
-
-## 🚀 Installation & Usage
-
-### 1. Clone the repository:
 ```bash
-git clone https://github.com/its-Kor/v1.0---Core-Scanner.git
-```
-
-### 2. Access the directory:
-```bash
-cd v1.0---Core-Scanner
-```
-
-### 3. Run the scanner:
-
-**Interactive mode (default top 15 ports):**
-```bash
+# Interactive fallback (no arguments needed)
 python3 main.py
+
+# Default quick scan (15 common ports)
+python3 main.py -t 192.168.1.10
+
+# Custom ports / ranges
+python3 main.py -t example.com -p 22,80,443
+python3 main.py -t example.com -p 1-1024
+
+# Built-in port profiles
+python3 main.py -t example.com --top-100 -y
+python3 main.py -t example.com --top-1000 -y
+
+# Low-impact scan of a sensitive target
+python3 main.py -t example.com --gentle -y
+
+# Save results
+python3 main.py -t example.com --top-100 -y -o report.json
+python3 main.py -t example.com --top-100 -y -o report.csv --csv
 ```
 
-**CLI mode with custom ports and range:**
+## ⚙️ Options
+
+| Flag | Description |
+|---|---|
+| `-t`, `--target` | IP or domain to scan (prompts interactively if omitted) |
+| `-p`, `--ports` | Ports/ranges, e.g. `22,80,443` or `1-1024` |
+| `--top-100` | Scan a curated list of 100 common ports |
+| `--top-1000` | Scan ports 1-1000 |
+| `--timeout` | Socket timeout in seconds (default `1.0`) |
+| `-w`, `--workers` | Concurrent workers, 1-100 (default `20`) |
+| `--gentle` | Low-impact mode: fewer workers, longer timeout |
+| `-y`, `--yes` | Skip the permission confirmation prompt |
+| `-o`, `--output` | Save results to this path |
+| `--csv` | Save `-o` results as CSV instead of JSON |
+
+`-p`, `--top-100` and `--top-1000` are mutually exclusive.
+
+## 🧪 Testing
+
 ```bash
-python3 main.py -t 127.0.0.1 -p 22,80,443,8000-8010
+python3 test_main.py
 ```
 
-**Low-impact mode for production/sensitive targets:**
-```bash
-python3 main.py -t example.com --gentle
-```
+## ⚠️ Responsible use
 
-**Automated execution with JSON report export:**
-```bash
-python3 main.py -t 192.168.1.1 -p 1-1024 -w 30 -y -o report.json
-```
+Only scan systems you own or have explicit, documented authorization to
+test. Unauthorized scanning may be illegal depending on your jurisdiction.
+The permission prompt is there as a safeguard, not a substitute for actual
+authorization.
 
----
+## 🧭 Project principles
 
-## ⚙️ CLI Options
+- 🔒 **100% standard library** — no runtime dependency ever required.
+- 🕶️ **Zero telemetry** — nothing is sent anywhere; everything stays local.
+- 💾 **Explicit-only writes** — no file is written unless `-o` is passed.
+- 🔍 **Honest socket states** — `open` / `closed` / `no_response`, always.
+- 🕹️ **Interactive fallback** — the CLI never hard-fails for a missing `-t`.
 
-| Flag | Description | Default |
-| :--- | :--- | :--- |
-| `-t`, `--target` | Target IP address, hostname, or URL | Interactive prompt |
-| `-p`, `--ports` | Comma-separated ports and/or ranges (e.g., `22,80,8000-8010`) | 15 common ports |
-| `-w`, `--workers` | Number of concurrent threads (`1-100`) | `20` |
-| `--timeout` | Socket connection timeout in seconds | `1.0` |
-| `--gentle` | Low-impact mode (caps at `3` workers, min `2.0s` timeout) | `False` |
-| `-y`, `--yes` | Skip interactive permission confirmation prompt | `False` |
-| `-o`, `--output` | Export structured scan results to a JSON file | `None` |
+## 🗺️ Roadmap
 
----
-
-## 🖥️ Example Output
-
-```text
-=============================================
-           NETWORK PORT SCANNER v1.2         
-=============================================
-
-[*] Run 9f4a2c1b at 2026-10-16 17:19:45 UTC
-[*] Target: localhost (127.0.0.1)
-[*] 15 ports | workers=3 | timeout=2.0s
-[?] Do you have permission to scan this target? [y/N] y
----------------------------------------------
-[+] Port 22   /TCP : OPEN  (ssh)
-[+] Port 80   /TCP : OPEN  (http)
-[+] Port 8080 /TCP : OPEN  (http-alt)
----------------------------------------------
-[*] Scan completed in 0.04s! 3 open, 12 closed, 0 no response.
-=============================================
-```
-
----
-
-## ⚠️ Legal Disclaimer
-
-This tool is developed strictly for **educational purposes, authorized security auditing, and lab environments**. Scanning targets without prior mutual consent may be illegal in your jurisdiction. The author assumes no liability and is not responsible for any misuse or damage caused by this program. Always obtain explicit permission before scanning any network or host.
+- [x] Robust target parsing (host, host:port, full URL)
+- [x] Port state distinction (open/closed/no_response)
+- [x] Configurable timeout constant
+- [x] `argparse`-based CLI with interactive fallback
+- [x] Concurrent scanning (`ThreadPoolExecutor`)
+- [x] Gentle mode + run ID/UTC header
+- [x] Permission confirmation prompt
+- [x] JSON export
+- [x] CSV export
+- [x] Port profiles (`--top-100` / `--top-1000`)
+- [ ] Batch targets from file (`-i`/`--input-file`)
+- [ ] RTT (latency) metrics per port
+- [ ] Lightweight banner grabbing
