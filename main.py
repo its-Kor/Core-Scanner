@@ -2,24 +2,24 @@
 import socket
 import sys
 
+def clean_target(user_input):
+    """Strip the protocol and path if the user pastes a full URL."""
+    target = user_input.strip()
+    if "://" in target:
+        target = target.split("://")[1]
+    return target.split("/")[0]
+
+
 def scan_port(target_ip, port):
-    """
-    Attempts to connect to a specific port on the target IP.
-    Returns True if open, False if closed or filtered.
-    """
+    """Attempt to connect to a specific port on the target IP.
+    Returns True if the port is open, False otherwise."""
+    
     try:
-        # Creates the socket (IPv4, TCP)
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # 0.1s timeout for faster scanning
-        client.settimeout(0.1)
-        
-        # connect_ex returns 0 if the connection is successful
-        code = client.connect_ex((target_ip, port))
-        client.close()
-        
-        return code == 0
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.settimeout(0.2)
+            code = client.connect_ex((target_ip, port))
+            return code == 0  
+    except socket.error:
         return False
 
 def main():
@@ -28,7 +28,12 @@ def main():
     print("="*45)
     
     # Dynamic Target: User inputs the address instead of hardcoding
-    target = input("[?] Enter the target IP or Domain (e.g., google.com): ")
+    raw_target = input("[?] Enter the target IP or domain: ")
+    target = clean_target(raw_target)
+
+    if not target:
+        print("\n[-] Error: No target provided.")
+        sys.exit(1)
     
     # List of main ports to check
     ports = [21, 22, 25, 80, 443, 445, 3306]
@@ -38,7 +43,7 @@ def main():
         target_ip = socket.gethostbyname(target)
     except socket.gaierror:
         print("\n[-] Error: Invalid hostname or DNS resolution failure.")
-        sys.exit()
+        sys.exit(1)
 
     print(f"\n[*] Starting scan on target: {target} ({target_ip})")
     print("-" * 45)
@@ -60,4 +65,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n[-] Scan interrupted by user.")
-        sys.exit()
+        sys.exit(0)
