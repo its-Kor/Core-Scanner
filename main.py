@@ -23,7 +23,7 @@ def scan_port(target_ip, port):
     Returns True if the port is open, False otherwise."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
-            client.settimeout(0.2)
+            client.settimeout(0.3)
             code = client.connect_ex((target_ip, port))
             return code == 0  
     except socket.error:
@@ -31,7 +31,7 @@ def scan_port(target_ip, port):
 
 def main():
     print("="*45)
-    print("           NETWORK PORT SCANNER v1.0         ")
+    print("           NETWORK PORT SCANNER v1.1         ")
     print("="*45)
     
     # Dynamic Target: User inputs the address instead of hardcoding
@@ -43,7 +43,7 @@ def main():
         sys.exit(1)
     
     # List of main ports to check
-    ports = [21, 22, 25, 80, 443, 445, 3306]
+    ports = [21, 22, 23, 25, 53, 80, 110, 139, 443, 445, 3306, 3389, 5432, 8080, 8443]
     
     try:
         # Ensures that if the user types a domain, it gets converted to an IP
@@ -72,6 +72,6 @@ if __name__ == "__main__":
     # Allows interrupting the script with Ctrl+C without showing ugly traceback errors
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\n[-] Scan interrupted by user.")
         sys.exit(0)
