@@ -2,10 +2,13 @@
 import argparse
 import csv
 import errno
+import ipaddress
 import json
 import socket
 import sys
+import time
 import uuid
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -39,6 +42,25 @@ TOP_100_PORTS = [
 # frequency list like some third-party tools ship.
 TOP_1000_PORTS = list(range(1, 1001))
 
+# Safety cap for batch target files: a single CIDR block (e.g. a typo like
+# "/8" instead of "/28") must never silently blow up into a scan of
+# millions of hosts. Anything larger than this is rejected with a clear
+# error instead of being expanded.
+MAX_HOSTS_PER_CIDR = 1024
+
+# Dedicated, short timeout for the passive banner read. Deliberately
+# independent of the connection --timeout (which --gentle extends): a
+# banner, when a service sends one, arrives almost instantly, so waiting
+# the full connection timeout for it would be wasteful.
+BANNER_TIMEOUT = 0.75
+BANNER_MAX_BYTES = 256
+BANNER_MAX_LEN = 200
+
+# state:   'open' / 'closed' (refused) / 'no_response' (timeout/error)
+# rtt_ms:  round-trip time of the connection attempt itself, in ms
+# banner:  short passive read of unprompted service data, or None
+ScanResult = namedtuple("ScanResult", ["state", "rtt_ms", "banner"])
+
 
 def get_service_name(port):
     """Returns the standard service name for a port (e.g., 80 -> HTTP)."""
@@ -59,6 +81,49 @@ def clean_target(user_input):
         return ""
 
 
+def read_targets_file(path):
+    """Read targets from a file: one per line. Supports bare hosts,
+    host:port, full URLs (same as clean_target) and simple CIDR blocks
+    (e.g. 192.168.1.0/30), which get expanded into individual IPs.
+    '#' starts a comment (to end of line); blank lines are ignored.
+    Duplicate targets are removed, order is preserved."""
+    targets = []
+    seen = set()
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        if "/" in line and "://" not in line:
+            # Looks like CIDR notation (and not a URL with a path).
+            try:
+                network = ipaddress.ip_network(line, strict=False)
+            except ValueError:
+                raise ValueError(f"invalid CIDR block: {line!r}")
+            if network.num_addresses > MAX_HOSTS_PER_CIDR:
+                raise ValueError(
+                    f"{line!r} expands to {network.num_addresses} hosts, "
+                    f"which is over the safety limit of {MAX_HOSTS_PER_CIDR}"
+                )
+            expanded = [str(ip) for ip in network]
+        else:
+            cleaned = clean_target(line)
+            expanded = [cleaned] if cleaned else []
+
+        for t in expanded:
+            if t not in seen:
+                seen.add(t)
+                targets.append(t)
+
+    if not targets:
+        raise ValueError(f"no valid targets found in {path}")
+    return targets
+
+
 def parse_ports(spec):
     """Turn '22,80,8000-8010' into a sorted list of ints.
     Trailing/empty commas (e.g. '22,80,') are ignored instead of raising."""
@@ -75,28 +140,63 @@ def parse_ports(spec):
     return sorted(ports)
 
 
-def scan_port(target_ip, port, timeout=TIMEOUT):
-    """Return 'open', 'closed' (refused) or 'no_response' (timeout/error)."""
+def _read_banner(sock):
+    """Best-effort passive read of a service banner on an already-open
+    socket. Returns None if nothing arrives before BANNER_TIMEOUT --
+    many services (HTTP, databases, ...) never send anything unprompted,
+    and that is an entirely normal result, not an error."""
+    try:
+        sock.settimeout(BANNER_TIMEOUT)
+        data = sock.recv(BANNER_MAX_BYTES)
+    except socket.error:
+        return None
+    if not data:
+        return None
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    return text.splitlines()[0][:BANNER_MAX_LEN]
+
+
+def scan_port(target_ip, port, timeout=TIMEOUT, grab_banner=False):
+    """Attempt to connect to one port. Always returns a ScanResult with
+    the same honest 'open'/'closed'/'no_response' state as before, plus
+    the connection's round-trip time in milliseconds. When grab_banner is
+    True and the port is open, also attempts one short passive read of
+    whatever the service sends unprompted (SSH/FTP/SMTP greetings, etc.)
+    before the socket closes; this is skipped entirely for closed or
+    unresponsive ports."""
+    banner = None
+    start = time.perf_counter()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
             client.settimeout(timeout)
             code = client.connect_ex((target_ip, port))
+            rtt_ms = (time.perf_counter() - start) * 1000
+            if code == 0:
+                state = "open"
+                if grab_banner:
+                    banner = _read_banner(client)
+            elif code == errno.ECONNREFUSED:
+                state = "closed"
+            else:
+                state = "no_response"
     except socket.error:
-        return "no_response"
-    if code == 0:
-        return "open"
-    if code == errno.ECONNREFUSED:
-        return "closed"
-    return "no_response"
+        rtt_ms = (time.perf_counter() - start) * 1000
+        state = "no_response"
+    return ScanResult(state, round(rtt_ms, 2), banner)
 
 
 def parse_args():
     """Read the command-line arguments."""
     p = argparse.ArgumentParser(description="Simple TCP port scanner")
-    p.add_argument("-t", "--target", help="IP or domain to scan")
 
-    # Only one port source may be chosen at a time -- argparse enforces
-    # this and prints a friendly error if two are combined by mistake.
+    target_source = p.add_mutually_exclusive_group()
+    target_source.add_argument("-t", "--target", help="IP or domain to scan")
+    target_source.add_argument("-i", "--input-file",
+                                help="file with one target per line "
+                                     "(IPs, domains, or simple CIDR blocks)")
+
     port_source = p.add_mutually_exclusive_group()
     port_source.add_argument("-p", "--ports", help="e.g. 22,80,443 or 1-1024")
     port_source.add_argument("--top-100", action="store_true",
@@ -112,6 +212,8 @@ def parse_args():
                    help="fewer workers, longer timeout (less noisy on the network)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="skip the permission confirmation prompt")
+    p.add_argument("--banners", action="store_true",
+                   help="passively read a short service banner on open ports")
     p.add_argument("-o", "--output", help="save results to this path")
     p.add_argument("--csv", action="store_true",
                    help="save -o results as CSV instead of JSON")
@@ -130,27 +232,46 @@ def resolve_ports(args):
     return DEFAULT_PORTS
 
 
-def save_results(path, as_csv, run_id, target, target_ip, ports, states):
-    """Write the scan results to disk, in JSON (default) or CSV (--csv)."""
+def resolve_targets(args):
+    """Decide which raw target strings to scan: from -i/--input-file,
+    from -t/--target, or (if neither was given) the usual input() prompt."""
+    if args.input_file:
+        return read_targets_file(args.input_file)
+    raw = args.target or input("[?] Enter the target IP or domain: ")
+    return [raw]
+
+
+def save_results(path, as_csv, run_id, scans):
+    """Write the scan results to disk, in JSON (default) or CSV (--csv).
+    `scans` is a list of {"target", "ip", "ports", "results"} dicts, one
+    per target. Both formats are built from the SAME flat list of
+    per-port records, so adding a target just appends more records --
+    nothing about an earlier target is ever overwritten."""
+    records = []
+    for scan in scans:
+        for port, result in zip(scan["ports"], scan["results"]):
+            records.append({
+                "target": scan["target"],
+                "ip": scan["ip"],
+                "port": port,
+                "state": result.state,
+                "service": get_service_name(port),
+                "rtt_ms": result.rtt_ms,
+                "banner": result.banner,
+            })
+
     if as_csv:
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["run_id", "target", "ip", "port", "state", "service"])
-            for port, state in zip(ports, states):
-                writer.writerow([run_id, target, target_ip, port, state,
-                                  get_service_name(port)])
+            writer.writerow(["run_id", "target", "ip", "port", "state",
+                              "service", "rtt_ms", "banner"])
+            for r in records:
+                writer.writerow([run_id, r["target"], r["ip"], r["port"],
+                                  r["state"], r["service"], f"{r['rtt_ms']:.2f}",
+                                  r["banner"] or ""])
     else:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "run_id": run_id,
-                    "target": target,
-                    "ip": target_ip,
-                    "results": dict(zip(ports, states)),
-                },
-                f,
-                indent=2,
-            )
+            json.dump({"run_id": run_id, "results": records}, f, indent=2)
 
 
 def main():
@@ -165,14 +286,22 @@ def main():
         args.timeout = max(args.timeout, 2.0)
 
     print("=" * 45)
-    print("           NETWORK PORT SCANNER v1.3         ")
+    print("           NETWORK PORT SCANNER v1.5         ")
     print("=" * 45)
 
-    raw_target = args.target or input("[?] Enter the target IP or domain: ")
-    target = clean_target(raw_target)
+    try:
+        raw_targets = resolve_targets(args)
+    except (ValueError, OSError) as e:
+        print(f"\n[-] Error: {e}")
+        sys.exit(1)
 
-    if not target:
-        print("\n[-] Error: No target provided.")
+    targets = []
+    for raw in raw_targets:
+        cleaned = clean_target(raw)
+        if cleaned:
+            targets.append(cleaned)
+    if not targets:
+        print("\n[-] Error: No valid target provided.")
         sys.exit(1)
 
     try:
@@ -181,45 +310,72 @@ def main():
         print(f"\n[-] Error: {e}")
         sys.exit(1)
 
-    try:
-        target_ip = socket.gethostbyname(target)
-    except socket.gaierror:
-        print("\n[-] Error: Invalid hostname or DNS resolution failure.")
+    resolved = []
+    for t in targets:
+        try:
+            resolved.append((t, socket.gethostbyname(t)))
+        except socket.gaierror:
+            print(f"[-] Skipping {t}: invalid hostname or DNS resolution failure.")
+
+    if not resolved:
+        print("\n[-] Error: no target could be resolved.")
         sys.exit(1)
 
     run_id = uuid.uuid4().hex[:8]
     print(f"\n[*] Run {run_id} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
-    print(f"[*] Target: {target} ({target_ip})")
-    print(f"[*] {len(ports)} ports | workers={args.workers} | timeout={args.timeout}s")
+    if len(resolved) == 1:
+        target, target_ip = resolved[0]
+        print(f"[*] Target: {target} ({target_ip})")
+    else:
+        print(f"[*] Targets ({len(resolved)}):")
+        for target, target_ip in resolved:
+            print(f"    - {target} ({target_ip})")
+    print(f"[*] {len(ports)} ports | workers={args.workers} | timeout={args.timeout}s"
+          f"{' | banners=on' if args.banners else ''}")
 
     # Explicit authorization check before any packet is sent.
     if not args.yes:
-        answer = input("[?] Do you have permission to scan this target? [y/N] ")
+        who = "this target" if len(resolved) == 1 else f"these {len(resolved)} targets"
+        answer = input(f"[?] Do you have permission to scan {who}? [y/N] ")
         if answer.strip().lower() != "y":
             print("[-] Cancelled.")
             sys.exit(0)
 
     print("-" * 45)
 
-    counts = {"open": 0, "closed": 0, "no_response": 0}
+    grand_counts = {"open": 0, "closed": 0, "no_response": 0}
+    scans = []
     start_time = datetime.now()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        states = list(pool.map(lambda p: scan_port(target_ip, p, args.timeout), ports))
+    for target, target_ip in resolved:
+        if len(resolved) > 1:
+            print(f"\n[*] Scanning {target} ({target_ip})")
 
-    for port, state in zip(ports, states):
-        counts[state] += 1
-        if state == "open":
-            print(f"[+] Port {port:<5}/TCP : OPEN ({get_service_name(port)})")
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            results = list(pool.map(
+                lambda p: scan_port(target_ip, p, args.timeout, args.banners),
+                ports,
+            ))
+
+        for port, result in zip(ports, results):
+            grand_counts[result.state] += 1
+            if result.state == "open":
+                line = (f"[+] Port {port:<5}/TCP : OPEN ({get_service_name(port)}) "
+                        f"- {result.rtt_ms:.2f}ms")
+                if result.banner:
+                    line += f" | {result.banner}"
+                print(line)
+
+        scans.append({"target": target, "ip": target_ip, "ports": ports, "results": results})
 
     duration = (datetime.now() - start_time).total_seconds()
     print("-" * 45)
     print(f"[*] Scan completed in {duration:.2f}s! "
-          f"{counts['open']} open, {counts['closed']} closed, "
-          f"{counts['no_response']} no response.")
+          f"{grand_counts['open']} open, {grand_counts['closed']} closed, "
+          f"{grand_counts['no_response']} no response.")
 
     if args.output:
-        save_results(args.output, args.csv, run_id, target, target_ip, ports, states)
+        save_results(args.output, args.csv, run_id, scans)
         fmt = "CSV" if args.csv else "JSON"
         print(f"[*] Results saved to {args.output} ({fmt})")
 
