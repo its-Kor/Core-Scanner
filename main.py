@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import errno
 import json
 import socket
@@ -15,6 +16,28 @@ from urllib.parse import urlparse
 TIMEOUT = 1.0  # seconds to wait per port
 DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 443, 445,
                   3306, 3389, 5432, 8080, 8443]
+
+# Curated list of 100 commonly-seen / frequently-scanned TCP ports
+# (classic well-known services + widely used application ports).
+# Not an exact copy of any specific vendor's proprietary ranking.
+TOP_100_PORTS = [
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80,
+    88, 110, 111, 119, 123, 135, 137, 138, 139, 143,
+    161, 162, 179, 194, 389, 443, 445, 464, 465, 500,
+    512, 513, 514, 515, 520, 540, 548, 554, 587, 593,
+    623, 631, 636, 646, 691, 860, 873, 902, 989, 990,
+    993, 995, 1025, 1026, 1027, 1028, 1029, 1080, 1194, 1241,
+    1311, 1337, 1433, 1434, 1521, 1723, 1755, 1812, 1813, 1883,
+    2000, 2049, 2082, 2083, 2086, 2087, 2095, 2096, 2222, 2375,
+    3000, 3128, 3268, 3306, 3389, 3690, 4444, 4500, 4567, 4899,
+    5000, 5060, 5432, 5900, 5985, 5986, 6379, 6667, 7000, 8080,
+]
+
+# Deliberately simple and transparent definition: the 1000 lowest-numbered
+# ports (1-1000). This covers essentially every IANA "well-known" port and
+# is easy to verify/reason about -- it is NOT a statistically-ranked
+# frequency list like some third-party tools ship.
+TOP_1000_PORTS = list(range(1, 1001))
 
 
 def get_service_name(port):
@@ -71,7 +94,16 @@ def parse_args():
     """Read the command-line arguments."""
     p = argparse.ArgumentParser(description="Simple TCP port scanner")
     p.add_argument("-t", "--target", help="IP or domain to scan")
-    p.add_argument("-p", "--ports", help="e.g. 22,80,443 or 1-1024")
+
+    # Only one port source may be chosen at a time -- argparse enforces
+    # this and prints a friendly error if two are combined by mistake.
+    port_source = p.add_mutually_exclusive_group()
+    port_source.add_argument("-p", "--ports", help="e.g. 22,80,443 or 1-1024")
+    port_source.add_argument("--top-100", action="store_true",
+                              help="scan the 100 most common ports")
+    port_source.add_argument("--top-1000", action="store_true",
+                              help="scan ports 1-1000")
+
     p.add_argument("--timeout", type=float, default=TIMEOUT,
                    help="socket timeout in seconds")
     p.add_argument("-w", "--workers", type=int, default=20,
@@ -80,8 +112,45 @@ def parse_args():
                    help="fewer workers, longer timeout (less noisy on the network)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="skip the permission confirmation prompt")
-    p.add_argument("-o", "--output", help="save results as JSON to this path")
+    p.add_argument("-o", "--output", help="save results to this path")
+    p.add_argument("--csv", action="store_true",
+                   help="save -o results as CSV instead of JSON")
     return p.parse_args()
+
+
+def resolve_ports(args):
+    """Decide which port list to scan, based on the mutually exclusive
+    -p / --top-100 / --top-1000 flags (falls back to DEFAULT_PORTS)."""
+    if args.top_1000:
+        return TOP_1000_PORTS
+    if args.top_100:
+        return TOP_100_PORTS
+    if args.ports:
+        return parse_ports(args.ports)
+    return DEFAULT_PORTS
+
+
+def save_results(path, as_csv, run_id, target, target_ip, ports, states):
+    """Write the scan results to disk, in JSON (default) or CSV (--csv)."""
+    if as_csv:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["run_id", "target", "ip", "port", "state", "service"])
+            for port, state in zip(ports, states):
+                writer.writerow([run_id, target, target_ip, port, state,
+                                  get_service_name(port)])
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "run_id": run_id,
+                    "target": target,
+                    "ip": target_ip,
+                    "results": dict(zip(ports, states)),
+                },
+                f,
+                indent=2,
+            )
 
 
 def main():
@@ -96,7 +165,7 @@ def main():
         args.timeout = max(args.timeout, 2.0)
 
     print("=" * 45)
-    print("           NETWORK PORT SCANNER v1.2         ")
+    print("           NETWORK PORT SCANNER v1.3         ")
     print("=" * 45)
 
     raw_target = args.target or input("[?] Enter the target IP or domain: ")
@@ -107,7 +176,7 @@ def main():
         sys.exit(1)
 
     try:
-        ports = parse_ports(args.ports) if args.ports else DEFAULT_PORTS
+        ports = resolve_ports(args)
     except ValueError as e:
         print(f"\n[-] Error: {e}")
         sys.exit(1)
@@ -150,18 +219,9 @@ def main():
           f"{counts['no_response']} no response.")
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "run_id": run_id,
-                    "target": target,
-                    "ip": target_ip,
-                    "results": dict(zip(ports, states)),
-                },
-                f,
-                indent=2,
-            )
-        print(f"[*] Results saved to {args.output}")
+        save_results(args.output, args.csv, run_id, target, target_ip, ports, states)
+        fmt = "CSV" if args.csv else "JSON"
+        print(f"[*] Results saved to {args.output} ({fmt})")
 
 
 if __name__ == "__main__":
