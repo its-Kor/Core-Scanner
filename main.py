@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 import socket
 import sys
+from datetime import datetime
+
+def get_service_name(port):
+    """Returns the standard service name for a port (e.g., 80 -> HTTP)."""
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "Unknown"
 
 def clean_target(user_input):
     """Strip the protocol and path if the user pastes a full URL."""
@@ -9,11 +17,10 @@ def clean_target(user_input):
         target = target.split("://")[1]
     return target.split("/")[0]
 
-
 def scan_port(target_ip, port):
+
     """Attempt to connect to a specific port on the target IP.
     Returns True if the port is open, False otherwise."""
-    
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
             client.settimeout(0.2)
@@ -49,15 +56,17 @@ def main():
     print("-" * 45)
     
     open_ports = 0
-    
+    start_time = datetime.now()
+
     for port in ports:
         if scan_port(target_ip, port):
-            print(f"[+] Port {port:^4} / TCP : OPEN")
+            service_name = get_service_name(port)
+            print(f"[+] Port {port:<5}/TCP : OPEN ({service_name})")
             open_ports += 1
-            
+
+    duration = (datetime.now() - start_time).total_seconds()
     print("-" * 45)
-    print(f"[*] Scan complete! {open_ports} open port(s) found.")
-    print("="*45)
+    print(f"[*] Scan completed in {duration:.2f}s! {open_ports} open port(s) found.")
 
 if __name__ == "__main__":
     # Allows interrupting the script with Ctrl+C without showing ugly traceback errors
