@@ -5,26 +5,26 @@ correctness, operator safety, and explicit consent before scanning anything.
 
 ## ✨ Features ✨
 
-- 🐍 **Zero third-party dependencies** — Python standard library only, runs
+-  **Zero third-party dependencies** — Python standard library only, runs
   anywhere `python3` runs.
-- 🎯 **Honest port states** — every port is reported as `open`, `closed`
+-  **Honest port states** — every port is reported as `open`, `closed`
   (actively refused) or `no_response` (timeout), never a plain `True/False`.
 - ⚡ **Concurrent scanning** — `ThreadPoolExecutor`-based, with a validated
   worker limit (`-w/--workers`, 1-100) to avoid exhausting file descriptors.
-- 🍃 **Gentle mode** (`--gentle`) — automatically caps workers at 3 and raises
+-  **Gentle mode** (`--gentle`) — automatically caps workers at 3 and raises
   the timeout, for scanning sensitive environments with less network noise.
-- 🛡️ **Explicit authorization check** — asks for confirmation before sending
+-  **Explicit authorization check** — asks for confirmation before sending
   any packet, unless `-y/--yes` is passed.
-- 📂 **Flexible port selection** — a custom list/range (`-p`), or a built-in
+-  **Flexible port selection** — a custom list/range (`-p`), or a built-in
   profile (`--top-100`, `--top-1000`).
-- 📊 **Optional export** — JSON (default) or CSV (`--csv`), written to disk
+-  **Optional export** — JSON (default) or CSV (`--csv`), written to disk
   only when `-o/--output` is explicitly given. Nothing is saved by default.
-- 💬 **Interactive fallback** — if `-t/--target` is omitted, the scanner just
+-  **Interactive fallback** — if `-t/--target` is omitted, the scanner just
   asks for it instead of crashing.
 
 ## 📋 Requirements
 
-- 🐍 Python 3.8+ — no `pip install` needed.
+-  Python 3.8+ — no `pip install` needed.
 
 ## 🚀 Usage
 
@@ -104,3 +104,15 @@ authorization.
 - [ ] Batch targets from file (`-i`/`--input-file`)
 - [ ] RTT (latency) metrics per port
 - [ ] Lightweight banner grabbing
+
+<div align="center">
+  
+  ### ☕ Support My Work & Security Projects
+  
+  <p>If my tools or contributions in Red/Blue/Purple Team have been useful to you, consider supporting with a private and decentralized Bitcoin donation.</p>
+
+  <a href="https://trocador.app/anonpay/?ticker_to=btc&network_to=Mainnet&address=bc1q78nt9g3katjlwd0gx7rt8f2lfh7g0dz70kah7c&donation=True&simple_mode=False&email=cripto.swimwear205@passmail.net&buttonbgcolor=9c27b0&bgcolor=0f111aff&direct=True" target="_blank">
+    <img src="https://img.shields.io/badge/Support_with-Bitcoin_(AnonPay)-9c27b0?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Donate with Bitcoin via AnonPay">
+  </a>
+
+</div>
