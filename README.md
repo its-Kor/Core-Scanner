@@ -24,6 +24,18 @@ correctness, operator safety, and explicit consent before scanning anything.
 - **Passive banner grabbing** (`--banners`, opt-in) — on open ports, does
   one short, read-only check for whatever the service sends unprompted
   (SSH/FTP/SMTP greetings, etc.). Off by default; never sends a probe.
+- **Active probing** (`--probe`/`--active`, opt-in, implies `--banners`) —
+  if passive listening gets nothing (e.g. a quiet HTTP server), sends one
+  small, protocol-appropriate payload (`HEAD / HTTP/1.0`, a newline for
+  FTP/Telnet, `EHLO` for SMTP) to coax a reply. More invasive than the
+  default, hence its own flag.
+- **Adaptive timeout** (`--adaptive-timeout`, opt-in) — shrinks the
+  per-port timeout towards the observed average RTT as the scan
+  progresses. Can only ever make a scan *faster*; it never waits longer
+  than the `--timeout` you set.
+- **Diff against a previous scan** (`--diff old_report.json`) — flags
+  ports that are newly open or newly closed compared to an earlier JSON
+  report, for quick before/after auditing.
 - **Optional export** — JSON (default) or CSV (`--csv`), written to disk
   only when `-o/--output` is explicitly given. Nothing is saved by default.
 - **Interactive fallback** — if `-t/--target` is omitted, the scanner just
@@ -59,6 +71,15 @@ python3 main.py -i targets.txt --top-100 -y
 # Grab a passive banner on open ports (SSH/FTP/SMTP greetings, etc.)
 python3 main.py -t example.com --banners -y
 
+# Actively probe quiet services (e.g. HTTP) that don't talk first
+python3 main.py -t example.com --probe -y
+
+# Let the timeout adapt to how fast the target actually responds
+python3 main.py -t example.com --top-1000 --adaptive-timeout -y
+
+# Compare today's scan against yesterday's saved report
+python3 main.py -t example.com --top-100 -y --diff yesterday.json
+
 # Save results
 python3 main.py -t example.com --top-100 -y -o report.json
 python3 main.py -t example.com --top-100 -y -o report.csv --csv
@@ -76,10 +97,13 @@ python3 main.py -t example.com --top-100 -y -o report.csv --csv
 | `--timeout` | Socket timeout in seconds (default `1.0`) |
 | `-w`, `--workers` | Concurrent workers, 1-100 (default `20`) |
 | `--gentle` | Low-impact mode: fewer workers, longer timeout |
+| `--adaptive-timeout` | Shrink the timeout towards the observed avg RTT (never exceeds `--timeout`) |
 | `-y`, `--yes` | Skip the permission confirmation prompt |
 | `--banners` | Passively read a short service banner on open ports |
+| `--probe`, `--active` | Actively nudge quiet services for a reply (implies `--banners`) |
 | `-o`, `--output` | Save results to this path |
 | `--csv` | Save `-o` results as CSV instead of JSON |
+| `--diff` | Compare against a previous JSON report, flag new/closed ports |
 
 `-p`, `--top-100` and `--top-1000` are mutually exclusive, and so are
 `-t` and `-i`.
@@ -163,7 +187,9 @@ authorization.
 - [x] Batch targets from file (`-i`/`--input-file`)
 - [x] RTT (latency) metrics per port
 - [x] Lightweight, opt-in passive banner grabbing (`--banners`)
-- [ ] Dynamic timeout auto-tuning based on rolling average RTT
+- [x] Dynamic timeout auto-tuning based on rolling average RTT (`--adaptive-timeout`)
+- [x] Protocol-specific active probing (`--probe`)
+- [x] Diff against a previous scan (`--diff`)
 
 <div align="center">
   
