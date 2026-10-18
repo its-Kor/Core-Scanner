@@ -1,195 +1,124 @@
-# Network Port Scanner
+# Core-Scanner
 
-A dependency-free TCP port scanner built incrementally, with a focus on
-correctness, operator safety, and explicit consent before scanning anything.
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)
+![Version](https://img.shields.io/badge/release-v1.7-orange.svg)
+![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
 
-## Features
+A dependency-free TCP port scanner and service surface auditor built entirely on the **Python standard library**, focused on honest socket states, TLS inspection, operator safety, and structured reporting.
 
-- **Zero third-party dependencies** — Python standard library only, runs
-  anywhere `python3` runs.
-- **Honest port states** — every port is reported as `open`, `closed`
-  (actively refused) or `no_response` (timeout), never a plain `True/False`.
-- **Concurrent scanning** — `ThreadPoolExecutor`-based, with a validated
-  worker limit (`-w/--workers`, 1-100) to avoid exhausting file descriptors.
-- **Gentle mode** (`--gentle`) — automatically caps workers at 3 and raises
-  the timeout, for scanning sensitive environments with less network noise.
-- **Explicit authorization check** — asks for confirmation before sending
-  any packet, unless `-y/--yes` is passed.
-- **Flexible port selection** — a custom list/range (`-p`), or a built-in
-  profile (`--top-100`, `--top-1000`).
-- **Batch targets from a file** (`-i/--input-file`) — scan a whole list of
-  IPs, domains or simple CIDR blocks in one run, instead of one at a time.
-- **RTT per port** — every scan reports the connection's round-trip time
-  in milliseconds (`rtt_ms`), always on, at no extra network cost.
-- **Passive banner grabbing** (`--banners`, opt-in) — on open ports, does
-  one short, read-only check for whatever the service sends unprompted
-  (SSH/FTP/SMTP greetings, etc.). Off by default; never sends a probe.
-- **Active probing** (`--probe`/`--active`, opt-in, implies `--banners`) —
-  if passive listening gets nothing (e.g. a quiet HTTP server), sends one
-  small, protocol-appropriate payload (`HEAD / HTTP/1.0`, a newline for
-  FTP/Telnet, `EHLO` for SMTP) to coax a reply. More invasive than the
-  default, hence its own flag.
-- **Adaptive timeout** (`--adaptive-timeout`, opt-in) — shrinks the
-  per-port timeout towards the observed average RTT as the scan
-  progresses. Can only ever make a scan *faster*; it never waits longer
-  than the `--timeout` you set.
-- **Diff against a previous scan** (`--diff old_report.json`) — flags
-  ports that are newly open or newly closed compared to an earlier JSON
-  report, for quick before/after auditing.
-- **Optional export** — JSON (default) or CSV (`--csv`), written to disk
-  only when `-o/--output` is explicitly given. Nothing is saved by default.
-- **Interactive fallback** — if `-t/--target` is omitted, the scanner just
-  asks for it instead of crashing.
+```text
+=============================================
+           NETWORK PORT SCANNER v1.7         
+=============================================
 
-## Requirements
+[*] Run a1b2c3d4 at 2026-10-18 14:30:00 UTC
+[*] Target: example.com (93.184.216.34)
+[*] 100 ports | workers=20 | timeout=1.0s | banners=on+probe
 
-- Python 3.8+ — no `pip install` needed.
+[+] Port 22   /TCP : OPEN (ssh)   - 18.40ms | SSH-2.0-OpenSSH_8.9p1 Ubuntu-3
+[+] Port 80   /TCP : OPEN (http)  - 17.92ms | HTTP/1.1 301 Moved Permanently
+[+] Port 443  /TCP : OPEN (https) - 18.15ms [TLSv1.3/TLS_AES_256_GCM_SHA384] | HTTP/1.1 200 OK
+[+] Port 6379 /TCP : OPEN (unknown) - 19.04ms
+    [!] Redis exposed: verify 'protected-mode' and 'requirepass'.
+---------------------------------------------
+[*] Scan completed in 1.42s! 4 open, 94 closed, 2 no response.
+```
 
-## Usage
+---
+
+## Key Features
+
+* **Core Scanning Engine**
+  * **100% Standard Library:** Zero external dependencies (`pip install` is never required).
+  * **Honest Socket States:** Distinguishes between `open`, `closed` (`ECONNREFUSED`), and `no_response` (filtered/timeout), recording per-port RTT in milliseconds (`rtt_ms`).
+  * **Adaptive Timeout & Gentle Mode:** Dynamically shrinks timeouts toward observed open-port RTTs (`--adaptive-timeout`), or throttles concurrency for sensitive networks (`--gentle`, `--shuffle`).
+  * **Batch & CIDR Expansion:** Accepts single hosts, URLs, CIDR blocks (`192.168.1.0/28` capped at 1,024 hosts for safety), or target lists (`-i`).
+
+* **Service & TLS Inspection**
+  * **Passive Banner Grabbing (`--banners`):** Read-only capture of spontaneous service greetings (SSH, FTP, SMTP) without sending extra packets.
+  * **Real TLS Handshake:** Negotiates TLS on encrypted ports (`443`, `8443`, `993`, etc.) to report the exact protocol version and cipher suite (`TLSv1.3/TLS_AES_256_GCM_SHA384`).
+  * **TLS-Safe Active Probing (`--probe`):** Coaxes quiet services (HTTP, Redis, SMTP) with minimal stdlib payloads—sent *after* the TLS handshake on encrypted ports.
+  * **Passive Hardening Advisories:** Automatically flags commonly exposed risk ports (Telnet, SMB, unencrypted Docker socket, Redis, databases) with triage notes.
+
+* **Reporting & Baseline Auditing**
+  * **Multi-Format Export:** Outputs flat, append-friendly records to **JSON**, **CSV** (`--csv`), and human-readable **Markdown** (`--md`).
+  * **Baseline Diffing (`--diff`):** Compares current results against a previous JSON report to highlight newly opened (`+`) or newly closed (`-`) ports.
+
+---
+
+## Quick Start
 
 ```bash
-# Interactive fallback (no arguments needed)
-python3 main.py
-
-# Default quick scan (15 common ports)
+# 1. Interactive mode or default quick scan (15 common ports)
 python3 main.py -t 192.168.1.10
 
-# Custom ports / ranges
-python3 main.py -t example.com -p 22,80,443
-python3 main.py -t example.com -p 1-1024
+# 2. Scan top 100 ports with TLS inspection, active probing, and adaptive timeout
+python3 main.py -t example.com --top-100 --probe --adaptive-timeout -y
 
-# Built-in port profiles
-python3 main.py -t example.com --top-100 -y
-python3 main.py -t example.com --top-1000 -y
+# 3. Scan a CIDR subnet or target file in randomized order and export a Markdown report
+python3 main.py -t 192.168.1.0/28 --top-100 --shuffle -y --md report.md
+python3 main.py -i targets.txt --top-100 -y -o baseline.json
 
-# Low-impact scan of a sensitive target
-python3 main.py -t example.com --gentle -y
-
-# Batch scan every target listed in a file
-python3 main.py -i targets.txt --top-100 -y
-
-# Grab a passive banner on open ports (SSH/FTP/SMTP greetings, etc.)
-python3 main.py -t example.com --banners -y
-
-# Actively probe quiet services (e.g. HTTP) that don't talk first
-python3 main.py -t example.com --probe -y
-
-# Let the timeout adapt to how fast the target actually responds
-python3 main.py -t example.com --top-1000 --adaptive-timeout -y
-
-# Compare today's scan against yesterday's saved report
-python3 main.py -t example.com --top-100 -y --diff yesterday.json
-
-# Save results
-python3 main.py -t example.com --top-100 -y -o report.json
-python3 main.py -t example.com --top-100 -y -o report.csv --csv
+# 4. Compare today's surface against a previous baseline report
+python3 main.py -t example.com --top-100 -y --diff baseline.json
 ```
 
-## Options
+---
+
+## CLI Options
 
 | Flag | Description |
-|---|---|
-| `-t`, `--target` | IP or domain to scan (prompts interactively if omitted) |
-| `-i`, `--input-file` | File with one target per line (IPs, domains, or simple CIDR blocks) |
-| `-p`, `--ports` | Ports/ranges, e.g. `22,80,443` or `1-1024` |
-| `--top-100` | Scan a curated list of 100 common ports |
-| `--top-1000` | Scan ports 1-1000 |
-| `--timeout` | Socket timeout in seconds (default `1.0`) |
-| `-w`, `--workers` | Concurrent workers, 1-100 (default `20`) |
-| `--gentle` | Low-impact mode: fewer workers, longer timeout |
-| `--adaptive-timeout` | Shrink the timeout towards the observed avg RTT (never exceeds `--timeout`) |
-| `-y`, `--yes` | Skip the permission confirmation prompt |
-| `--banners` | Passively read a short service banner on open ports |
-| `--probe`, `--active` | Actively nudge quiet services for a reply (implies `--banners`) |
-| `-o`, `--output` | Save results to this path |
-| `--csv` | Save `-o` results as CSV instead of JSON |
-| `--diff` | Compare against a previous JSON report, flag new/closed ports |
+| :--- | :--- |
+| `-t`, `--target` | IP, domain, URL, or CIDR block to scan (prompts interactively if omitted) |
+| `-i`, `--input-file` | File with one target per line (hosts, URLs, or CIDR blocks; `#` comments supported) |
+| `-p`, `--ports` | Custom ports/ranges, e.g. `22,80,443` or `1-1024` |
+| `--top-100` | Scan a curated list of 100 commonly exposed TCP ports |
+| `--top-1000` | Scan IANA well-known ports `1-1000` |
+| `--timeout` | Socket timeout ceiling in seconds (default: `1.0`) |
+| `-w`, `--workers` | Concurrent worker threads, `1-100` (default: `20`) |
+| `--gentle` | Low-impact profile: caps workers at `3` and extends timeout to `>= 2.0s` |
+| `--shuffle` | Randomize port scan order on the wire (output remains sorted ascending) |
+| `--adaptive-timeout` | Shrink timeout toward the rolling average RTT of `open` ports |
+| `--banners` | Passively read service banners and perform TLS version/cipher inspection |
+| `--probe`, `--active` | Send minimal protocol-specific probe when passive read is empty (implies `--banners`) |
+| `-o`, `--output` | Write scan results to disk (JSON by default) |
+| `--csv` | Format `-o` output as CSV instead of JSON |
+| `--md` | Generate a human-readable Markdown assessment report |
+| `--diff` | Compare current scan against a previous JSON report (`-o`) |
+| `-y`, `--yes` | Skip the interactive authorization confirmation prompt |
 
-`-p`, `--top-100` and `--top-1000` are mutually exclusive, and so are
-`-t` and `-i`.
+---
 
-### Target file format (`-i/--input-file`)
+## Architecture & Scope Decisions
 
-One target per line. Bare hosts, `host:port`, full URLs, and simple CIDR
-blocks (e.g. `192.168.1.0/30`) are all accepted. `#` starts a comment,
-blank lines are ignored, and duplicates are removed automatically:
+* **Zero Third-Party Dependencies:** `python-nmap` and external libraries are deliberately excluded so the scanner runs on any clean Python 3.8+ environment.
+* **No Hand-Rolled ASN.1 Parser:** Rather than maintaining a fragile custom DER parser for X.509 certificates under `CERT_NONE`, the scanner reliably reports negotiated TLS versions/ciphers and delegates deep certificate chain auditing to dedicated tools (`openssl x509`, `testssl.sh`, `sslyze`).
 
-```
-# targets.txt
-10.0.0.5
-staging.example.com
-192.168.1.0/30   # expands to 4 individual IPs
-```
+---
 
-A single CIDR block is capped at 1024 expanded hosts as a safety net —
-a typo like `/8` instead of `/28` will raise a clear error instead of
-silently scanning millions of addresses.
+## Roadmap (v1.8)
 
-### Report schema (`-o`)
+- [ ] **Banner & report sanitization** — strip ANSI escapes/control bytes; escape backticks in `--md` and formula prefixes (`=`, `+`, `-`, `@`) in `--csv`
+- [ ] **Fail-fast output check** — validate that `-o` and `--md` directories exist and are writable before scanning
+- [ ] **TLS handshake timeout cap** — apply `BANNER_TIMEOUT` before `wrap_socket()` so non-TLS ports never stall for the full `--timeout`
+- [ ] **Richer protocol parsing** — HTTP `Host:` header, `Location:` redirects, and `<title>`; passive MySQL version decoding; Redis `PING` probe
+- [ ] **Opportunistic TLS fallback** — retry with a TLS handshake when `--probe` gets no plaintext reply on non-standard ports
+- [ ] **Smart CIDR & port handling** — exclude `.0`/`.255` on IPv4 subnets `< /31` and preserve explicit ports passed via `-t host:port`
+- [ ] **Dual-stack IPv4/IPv6** — resolve targets via `getaddrinfo()` with automatic `AF_INET` / `AF_INET6` socket selection
+- [ ] **Targeted retries (`--retries`)** — retry only `no_response` ports on lossy/VPN links without re-probing `open` or `closed` ports
+- [ ] **Instant `Ctrl+C` & scope-aware `--diff`** — cancel queued worker futures immediately on interrupt and ignore untested baseline ports in `--diff`
 
-Both JSON and CSV are built from the same flat list of per-port records,
-so scanning several targets just appends more records -- nothing about
-an earlier target is ever overwritten:
+---
 
-```json
-{
-  "run_id": "a1b2c3d4",
-  "results": [
-    {
-      "target": "192.168.1.50",
-      "ip": "192.168.1.50",
-      "port": 22,
-      "state": "open",
-      "service": "ssh",
-      "rtt_ms": 4.12,
-      "banner": "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5"
-    }
-  ]
-}
-```
+## Testing & Responsible Use
 
-`banner` is `null` unless `--banners` was passed. The CSV has the same
-columns as top-level keys here, one row per record.
-
-## Testing
-
+Run the unit test suite using standard library `unittest`:
 ```bash
 python3 test_main.py
 ```
 
-## ⚠️ Responsible use
-
-Only scan systems you own or have explicit, documented authorization to
-test. Unauthorized scanning may be illegal depending on your jurisdiction.
-The permission prompt is there as a safeguard, not a substitute for actual
-authorization.
-
-## Project principles
-
-- **100% standard library** — no runtime dependency ever required.
-- **Zero telemetry** — nothing is sent anywhere; everything stays local.
-- **Explicit-only writes** — no file is written unless `-o` is passed.
-- **Honest socket states** — `open` / `closed` / `no_response`, always.
-- **Interactive fallback** — the CLI never hard-fails for a missing `-t`.
-
-## Roadmap
-
-- [x] Robust target parsing (host, host:port, full URL)
-- [x] Port state distinction (open/closed/no_response)
-- [x] Configurable timeout constant
-- [x] `argparse`-based CLI with interactive fallback
-- [x] Concurrent scanning (`ThreadPoolExecutor`)
-- [x] Gentle mode + run ID/UTC header
-- [x] Permission confirmation prompt
-- [x] JSON export
-- [x] CSV export
-- [x] Port profiles (`--top-100` / `--top-1000`)
-- [x] Batch targets from file (`-i`/`--input-file`)
-- [x] RTT (latency) metrics per port
-- [x] Lightweight, opt-in passive banner grabbing (`--banners`)
-- [x] Dynamic timeout auto-tuning based on rolling average RTT (`--adaptive-timeout`)
-- [x] Protocol-specific active probing (`--probe`)
-- [x] Diff against a previous scan (`--diff`)
+> **Warning:** Only scan systems you own or have explicit, written authorization to test.
 
 <div align="center">
   
