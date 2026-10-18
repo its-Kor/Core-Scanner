@@ -4,7 +4,9 @@ import csv
 import errno
 import ipaddress
 import json
+import random
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -43,35 +45,56 @@ TOP_100_PORTS = [
 # frequency list like some third-party tools ship.
 TOP_1000_PORTS = list(range(1, 1001))
 
-# Safety cap for batch target files: a single CIDR block (e.g. a typo like
-# "/8" instead of "/28") must never silently blow up into a scan of
-# millions of hosts. Anything larger than this is rejected with a clear
-# error instead of being expanded.
+# Safety cap for batch target files / CIDR blocks: a typo like "/8"
+# instead of "/28" must never silently blow up into a scan of millions
+# of hosts. Anything larger than this is rejected with a clear error.
 MAX_HOSTS_PER_CIDR = 1024
 
 # Dedicated, short timeout for banner reads (passive or active). Kept
 # independent of the connection --timeout (which --gentle extends): a
-# banner, when a service sends one, arrives almost instantly, so waiting
-# the full connection timeout for it would be wasteful.
+# banner, when a service sends one, arrives almost instantly.
 BANNER_TIMEOUT = 0.75
 BANNER_MAX_BYTES = 256
 BANNER_MAX_LEN = 200
 
+# Ports that speak TLS directly (as opposed to plaintext-then-STARTTLS,
+# which this tool does not attempt). Banner/probe logic performs a real
+# TLS handshake on these before trying to read or send anything, instead
+# of throwing plaintext HTTP at an encrypted socket.
+TLS_PORTS = {443, 465, 636, 989, 990, 993, 995, 2083, 2087, 2096, 5986, 8443}
+
 # Minimal, protocol-appropriate payloads used ONLY when --probe is passed
-# and passive listening (the v1.5 default) got nothing back. Each one is
-# just enough to make a normally-quiet service say something -- no
-# exploitation, no third-party library, plain stdlib sockets.
+# and passive listening got nothing back. For TLS_PORTS, this is sent
+# AFTER the TLS handshake, over the encrypted stream. No exploitation,
+# no third-party library -- just stdlib sockets/ssl.
 ACTIVE_PROBE_PAYLOADS = {
     21: b"\r\n",                     # FTP: a nudge often re-sends the banner
     23: b"\r\n",                     # Telnet
     25: b"EHLO scanner\r\n",         # SMTP
     80: b"HEAD / HTTP/1.0\r\n\r\n",
     443: b"HEAD / HTTP/1.0\r\n\r\n",
+    6379: b"INFO server\r\n",        # Redis
     8000: b"HEAD / HTTP/1.0\r\n\r\n",
     8080: b"HEAD / HTTP/1.0\r\n\r\n",
     8443: b"HEAD / HTTP/1.0\r\n\r\n",
 }
 ACTIVE_PROBE_FALLBACK = b"\r\n"
+
+# Passive, well-known hardening reminders for commonly-exposed service
+# ports. Purely informational text, no exploit content -- the kind of
+# note any CIS-style hardening checklist already carries.
+PORT_SECURITY_NOTES = {
+    21: "Plaintext FTP: check for anonymous login and cleartext credentials.",
+    23: "Telnet exposed: cleartext remote admin; prefer SSH.",
+    139: "NetBIOS Session Service: verify SMB segmentation and null-session restrictions.",
+    445: "SMB over TCP: verify SMB signing requirement and patch level.",
+    2375: "Unencrypted Docker daemon socket: critical risk if reachable without TLS.",
+    3306: "MySQL/MariaDB exposed: verify network ACLs and authentication.",
+    3389: "RDP exposed: verify Network Level Authentication (NLA) and TLS enforcement.",
+    5432: "PostgreSQL exposed: review pg_hba.conf and TLS requirements.",
+    5900: "VNC exposed: verify authentication strength and encryption.",
+    6379: "Redis exposed: verify 'protected-mode' and 'requirepass'.",
+}
 
 # Adaptive timeout bounds: it can only ever shrink the operator's chosen
 # --timeout down towards real observed latency, never exceed it, and
@@ -80,20 +103,25 @@ ADAPTIVE_TIMEOUT_FLOOR = 0.2
 ADAPTIVE_TIMEOUT_MARGIN = 4.0   # new timeout = margin * observed avg RTT
 ADAPTIVE_TIMEOUT_ALPHA = 0.3    # EMA smoothing factor
 
-# state:   'open' / 'closed' (refused) / 'no_response' (timeout/error)
-# rtt_ms:  round-trip time of the connection attempt itself, in ms
-# banner:  short passive/active read of service data, or None
-ScanResult = namedtuple("ScanResult", ["state", "rtt_ms", "banner"])
+# state:     'open' / 'closed' (refused) / 'no_response' (timeout/error)
+# rtt_ms:    round-trip time of the connection attempt itself, in ms
+# banner:    short passive/active read of service data, or None
+# tls_info:  "TLSv1.x/CIPHER_NAME" for ports in TLS_PORTS, else None
+# advisory:  a PORT_SECURITY_NOTES hint for this port, or None
+ScanResult = namedtuple("ScanResult", ["state", "rtt_ms", "banner", "tls_info", "advisory"])
 
 
 class AdaptiveTimeout:
-    """Thread-safe exponential moving average of REAL observed RTTs
-    (from ports that answered, open or closed -- never from timeouts,
-    which carry no latency information). Used to shrink the per-port
-    socket timeout mid-scan when --adaptive-timeout is enabled. The
-    value only ever moves between ADAPTIVE_TIMEOUT_FLOOR and the
-    operator's original --timeout -- it can make a scan faster, never
-    slower than what was explicitly requested."""
+    """Thread-safe exponential moving average of REAL observed RTTs,
+    sourced ONLY from OPEN ports (not closed ones). This matters: some
+    networks have an edge firewall that answers closed ports with an
+    almost-instant RST, while real open services sit behind a slower
+    internal hop -- feeding both into the same average would bias the
+    timeout down based on the firewall's speed, not the service's, and
+    could start starving genuinely slow (but open) ports later in the
+    scan. The value only ever moves between ADAPTIVE_TIMEOUT_FLOOR and
+    the operator's original --timeout -- it can make a scan faster,
+    never slower than what was explicitly requested."""
 
     def __init__(self, ceiling):
         self._lock = threading.Lock()
@@ -131,7 +159,8 @@ def get_service_name(port):
 
 
 def clean_target(user_input):
-    """Extract the hostname from a bare host, host:port or full URL."""
+    """Extract the hostname from a bare host, host:port or full URL.
+    Does NOT handle CIDR notation -- see expand_target_entry for that."""
     target = user_input.strip()
     if "://" not in target:
         target = "//" + target
@@ -141,43 +170,46 @@ def clean_target(user_input):
         return ""
 
 
+def expand_target_entry(entry):
+    """Expand ONE raw target string into a list of concrete targets:
+    a CIDR block (e.g. 192.168.1.0/28) becomes every address in it; a
+    bare host, host:port or full URL becomes a single cleaned hostname.
+    Used for BOTH -t/--target and -i/--input-file, so a CIDR passed
+    directly via -t is expanded exactly like one found in a file --
+    previously, -t silently urlparse'd away the "/28" and scanned only
+    the network address."""
+    line = entry.split("#", 1)[0].strip()
+    if not line:
+        return []
+
+    if "/" in line and "://" not in line:
+        try:
+            network = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            raise ValueError(f"invalid CIDR block: {line!r}")
+        if network.num_addresses > MAX_HOSTS_PER_CIDR:
+            raise ValueError(
+                f"{line!r} expands to {network.num_addresses} hosts, "
+                f"which is over the safety limit of {MAX_HOSTS_PER_CIDR}"
+            )
+        return [str(ip) for ip in network]
+
+    cleaned = clean_target(line)
+    return [cleaned] if cleaned else []
+
+
 def read_targets_file(path):
-    """Read targets from a file: one per line. Supports bare hosts,
-    host:port, full URLs (same as clean_target) and simple CIDR blocks
-    (e.g. 192.168.1.0/30), which get expanded into individual IPs.
-    '#' starts a comment (to end of line); blank lines are ignored.
-    Duplicate targets are removed, order is preserved."""
+    """Read targets from a file: one per line (see expand_target_entry
+    for accepted formats). '#' starts a comment, blank lines are
+    ignored. Duplicates are removed, order is preserved."""
     targets = []
     seen = set()
-
     with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    for raw_line in lines:
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-
-        if "/" in line and "://" not in line:
-            try:
-                network = ipaddress.ip_network(line, strict=False)
-            except ValueError:
-                raise ValueError(f"invalid CIDR block: {line!r}")
-            if network.num_addresses > MAX_HOSTS_PER_CIDR:
-                raise ValueError(
-                    f"{line!r} expands to {network.num_addresses} hosts, "
-                    f"which is over the safety limit of {MAX_HOSTS_PER_CIDR}"
-                )
-            expanded = [str(ip) for ip in network]
-        else:
-            cleaned = clean_target(line)
-            expanded = [cleaned] if cleaned else []
-
-        for t in expanded:
-            if t not in seen:
-                seen.add(t)
-                targets.append(t)
-
+        for raw_line in f:
+            for t in expand_target_entry(raw_line):
+                if t not in seen:
+                    seen.add(t)
+                    targets.append(t)
     if not targets:
         raise ValueError(f"no valid targets found in {path}")
     return targets
@@ -199,11 +231,25 @@ def parse_ports(spec):
     return sorted(ports)
 
 
+def _sni_for(hostname):
+    """Never send a literal IP address in the TLS SNI field (RFC 6066
+    says SNI is for hostnames; some OpenSSL/Python combinations raise
+    on an IP literal, others silently accept it -- either way, sending
+    one serves no purpose). Returns None for an IP, else the hostname."""
+    if not hostname:
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+        return None
+    except ValueError:
+        return hostname
+
+
 def _read_banner(sock):
     """Best-effort PASSIVE read of a service banner on an already-open
-    socket: never sends anything, just listens for BANNER_TIMEOUT.
-    Returns None if nothing arrives -- many services (HTTP, databases,
-    ...) never send anything unprompted, and that is a normal result."""
+    (and, for TLS ports, already-handshaken) socket: never sends
+    anything, just listens for BANNER_TIMEOUT. Returns None if nothing
+    arrives -- many services never send anything unprompted."""
     try:
         sock.settimeout(BANNER_TIMEOUT)
         data = sock.recv(BANNER_MAX_BYTES)
@@ -220,8 +266,9 @@ def _read_banner(sock):
 def _active_probe(sock, port):
     """ACTIVE probing: send one small, protocol-appropriate payload to
     coax a quiet service into responding, then do one more short read.
-    Only ever called when passive listening got nothing AND the operator
-    explicitly opted in with --probe (on top of --banners)."""
+    For TLS_PORTS, the caller has already wrapped `sock` in a completed
+    TLS handshake, so this payload travels encrypted, exactly like a
+    real client's would."""
     payload = ACTIVE_PROBE_PAYLOADS.get(port, ACTIVE_PROBE_FALLBACK)
     try:
         sock.sendall(payload)
@@ -237,15 +284,40 @@ def _active_probe(sock, port):
     return text.splitlines()[0][:BANNER_MAX_LEN]
 
 
-def scan_port(target_ip, port, timeout=TIMEOUT, grab_banner=False, active_probe=False):
+def _inspect_tls(raw_sock, hostname, port, active_probe):
+    """Perform a real TLS handshake on an already-connected socket and
+    report the negotiated protocol version and cipher. Certificate
+    validation is deliberately disabled (CERT_NONE) -- this is a
+    scanner, not a browser, and must be able to report on self-signed
+    or expired certificates rather than refuse to connect to them.
+    Returns (tls_info, banner); either may be None on failure."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with ctx.wrap_socket(raw_sock, server_hostname=_sni_for(hostname)) as tls_sock:
+            tls_ver = tls_sock.version() or "TLS"
+            cipher = tls_sock.cipher()
+            cipher_name = cipher[0] if cipher else "unknown-cipher"
+            tls_info = f"{tls_ver}/{cipher_name}"
+
+            banner = _read_banner(tls_sock)
+            if banner is None and active_probe:
+                banner = _active_probe(tls_sock, port)
+            return tls_info, banner
+    except (ssl.SSLError, socket.error):
+        return None, None
+
+
+def scan_port(target_ip, port, timeout=TIMEOUT, grab_banner=False,
+              active_probe=False, hostname=None):
     """Attempt to connect to one port. Always returns a ScanResult with
     the same honest 'open'/'closed'/'no_response' state as before, plus
-    the connection's round-trip time in milliseconds. When grab_banner is
-    True and the port is open, attempts one short PASSIVE read first;
-    if that yields nothing and active_probe is also True, sends one
-    small protocol-appropriate payload (ACTIVE_PROBE_PAYLOADS) and tries
-    once more. Both are skipped entirely for closed/unresponsive ports."""
+    RTT, and (only for open ports, only when asked) a banner, TLS info,
+    and a passive security advisory."""
     banner = None
+    tls_info = None
+    advisory = None
     start = time.perf_counter()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
@@ -254,10 +326,16 @@ def scan_port(target_ip, port, timeout=TIMEOUT, grab_banner=False, active_probe=
             rtt_ms = (time.perf_counter() - start) * 1000
             if code == 0:
                 state = "open"
+                advisory = PORT_SECURITY_NOTES.get(port)
                 if grab_banner:
-                    banner = _read_banner(client)
-                    if banner is None and active_probe:
-                        banner = _active_probe(client, port)
+                    if port in TLS_PORTS:
+                        tls_info, banner = _inspect_tls(
+                            client, hostname or target_ip, port, active_probe
+                        )
+                    else:
+                        banner = _read_banner(client)
+                        if banner is None and active_probe:
+                            banner = _active_probe(client, port)
             elif code == errno.ECONNREFUSED:
                 state = "closed"
             else:
@@ -265,7 +343,7 @@ def scan_port(target_ip, port, timeout=TIMEOUT, grab_banner=False, active_probe=
     except socket.error:
         rtt_ms = (time.perf_counter() - start) * 1000
         state = "no_response"
-    return ScanResult(state, round(rtt_ms, 2), banner)
+    return ScanResult(state, round(rtt_ms, 2), banner, tls_info, advisory)
 
 
 def parse_args():
@@ -273,7 +351,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Simple TCP port scanner")
 
     target_source = p.add_mutually_exclusive_group()
-    target_source.add_argument("-t", "--target", help="IP or domain to scan")
+    target_source.add_argument("-t", "--target", help="IP, domain, or CIDR to scan")
     target_source.add_argument("-i", "--input-file",
                                 help="file with one target per line "
                                      "(IPs, domains, or simple CIDR blocks)")
@@ -291,20 +369,23 @@ def parse_args():
                    help="concurrent workers (1-100)")
     p.add_argument("--gentle", action="store_true",
                    help="fewer workers, longer timeout (less noisy on the network)")
+    p.add_argument("--shuffle", action="store_true",
+                   help="randomize port scan order instead of ascending")
     p.add_argument("--adaptive-timeout", action="store_true",
-                   help="shrink the timeout towards the observed average RTT "
-                        "as the scan progresses (never exceeds --timeout)")
+                   help="shrink the timeout towards the observed average RTT of "
+                        "OPEN ports as the scan progresses (never exceeds --timeout)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="skip the permission confirmation prompt")
     p.add_argument("--banners", action="store_true",
-                   help="passively read a short service banner on open ports")
+                   help="read a short service banner (and TLS info) on open ports")
     p.add_argument("--probe", "--active", action="store_true", dest="probe",
                    help="if a passive banner read gets nothing, send one small "
                         "protocol-appropriate payload to coax a reply (implies "
-                        "--banners); more invasive than the default")
+                        "--banners; sent over TLS for TLS ports)")
     p.add_argument("-o", "--output", help="save results to this path")
     p.add_argument("--csv", action="store_true",
                    help="save -o results as CSV instead of JSON")
+    p.add_argument("--md", help="also save a human-readable Markdown report to this path")
     p.add_argument("--diff", help="compare against a previous JSON report "
                                    "(from -o) and flag new/closed ports")
     return p.parse_args()
@@ -314,48 +395,30 @@ def resolve_ports(args):
     """Decide which port list to scan, based on the mutually exclusive
     -p / --top-100 / --top-1000 flags (falls back to DEFAULT_PORTS)."""
     if args.top_1000:
-        return TOP_1000_PORTS
+        return list(TOP_1000_PORTS)
     if args.top_100:
-        return TOP_100_PORTS
+        return list(TOP_100_PORTS)
     if args.ports:
         return parse_ports(args.ports)
-    return DEFAULT_PORTS
+    return list(DEFAULT_PORTS)
 
 
 def resolve_targets(args):
     """Decide which raw target strings to scan: from -i/--input-file,
-    from -t/--target, or (if neither was given) the usual input() prompt."""
+    from -t/--target (CIDR-aware, see expand_target_entry), or (if
+    neither was given) the usual input() prompt."""
     if args.input_file:
         return read_targets_file(args.input_file)
-    raw = args.target or input("[?] Enter the target IP or domain: ")
-    return [raw]
-
-
-def save_results(path, as_csv, run_id, scans):
-    """Write the scan results to disk, in JSON (default) or CSV (--csv).
-    `scans` is a list of {"target", "ip", "ports", "results"} dicts, one
-    per target. Both formats are built from the SAME flat list of
-    per-port records, so adding a target just appends more records --
-    nothing about an earlier target is ever overwritten."""
-    records = build_records(run_id, scans)
-
-    if as_csv:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["run_id", "target", "ip", "port", "state",
-                              "service", "rtt_ms", "banner"])
-            for r in records:
-                writer.writerow([r["run_id"], r["target"], r["ip"], r["port"],
-                                  r["state"], r["service"], f"{r['rtt_ms']:.2f}",
-                                  r["banner"] or ""])
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"run_id": run_id, "results": records}, f, indent=2)
+    raw = args.target or input("[?] Enter the target IP, domain, or CIDR: ")
+    targets = expand_target_entry(raw)
+    if not targets:
+        raise ValueError("no valid target provided")
+    return targets
 
 
 def build_records(run_id, scans):
-    """Flatten `scans` into the per-port record list shared by both the
-    JSON and CSV writers, and by the --diff comparison."""
+    """Flatten `scans` into the per-port record list shared by the JSON
+    and CSV writers, the Markdown report, and the --diff comparison."""
     records = []
     for scan in scans:
         for port, result in zip(scan["ports"], scan["results"]):
@@ -367,9 +430,86 @@ def build_records(run_id, scans):
                 "state": result.state,
                 "service": get_service_name(port),
                 "rtt_ms": result.rtt_ms,
+                "tls_info": result.tls_info,
                 "banner": result.banner,
+                "advisory": result.advisory,
             })
     return records
+
+
+def save_results(path, as_csv, run_id, scans):
+    """Write the scan results to disk, in JSON (default) or CSV (--csv).
+    Both are built from the SAME flat list of per-port records, so
+    scanning several targets just appends more records -- nothing about
+    an earlier target is ever overwritten."""
+    records = build_records(run_id, scans)
+
+    if as_csv:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["run_id", "target", "ip", "port", "state", "service",
+                              "rtt_ms", "tls_info", "banner", "advisory"])
+            for r in records:
+                writer.writerow([r["run_id"], r["target"], r["ip"], r["port"],
+                                  r["state"], r["service"], f"{r['rtt_ms']:.2f}",
+                                  r["tls_info"] or "", r["banner"] or "",
+                                  r["advisory"] or ""])
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": run_id, "results": records}, f, indent=2)
+
+
+def save_markdown_report(path, run_id, scans, duration, diff_result=None):
+    """Write a human-readable Markdown summary: an open-ports table,
+    any passive hardening advisories, and (if --diff was used) what
+    changed since the previous report."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        f"# Port Scan Report (`{run_id}`)",
+        f"- **Generated:** {now_str}",
+        f"- **Duration:** {duration:.2f}s",
+        "",
+        "## Open Ports",
+        "| Target | IP | Port | Service | RTT (ms) | TLS | Banner |",
+        "| :--- | :--- | :--- | :--- | ---: | :--- | :--- |",
+    ]
+
+    advisories = []
+    any_open = False
+    for scan in scans:
+        for port, result in zip(scan["ports"], scan["results"]):
+            if result.state != "open":
+                continue
+            any_open = True
+            banner_cell = (result.banner or "-").replace("|", "\\|")
+            lines.append(
+                f"| `{scan['target']}` | `{scan['ip']}` | **{port}** | "
+                f"{get_service_name(port)} | {result.rtt_ms:.2f} | "
+                f"{result.tls_info or '-'} | `{banner_cell}` |"
+            )
+            if result.advisory:
+                advisories.append((scan["target"], port, result.advisory))
+
+    if not any_open:
+        lines.append("| *none* | - | - | - | - | - | - |")
+
+    if advisories:
+        lines += ["", "## Hardening Notes"]
+        for target, port, note in advisories:
+            lines.append(f"- **`{target}:{port}`** -- {note}")
+
+    if diff_result is not None:
+        new_open, newly_closed = diff_result
+        lines += ["", "## Changes Since Previous Report"]
+        if not new_open and not newly_closed:
+            lines.append("- No port state changes detected.")
+        for target, port in new_open:
+            lines.append(f"- **[NEW OPEN]** `{target}:{port}`")
+        for target, port in newly_closed:
+            lines.append(f"- **[CLOSED]** `{target}:{port}`")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def load_previous_report(path):
@@ -383,11 +523,7 @@ def load_previous_report(path):
         raise ValueError(f"could not read previous report {path!r}: {e}")
     if not isinstance(data, dict) or "results" not in data:
         raise ValueError(f"{path!r} doesn't look like a report produced by this tool")
-
-    previous = {}
-    for r in data["results"]:
-        previous[(r["target"], r["port"])] = r["state"]
-    return previous
+    return {(r["target"], r["port"]): r["state"] for r in data["results"]}
 
 
 def diff_against_previous(previous, scans):
@@ -402,9 +538,9 @@ def diff_against_previous(previous, scans):
             key = (scan["target"], port)
             old_state = previous.get(key)
             if result.state == "open" and old_state != "open":
-                new_open.append((scan["target"], port))
+                new_open.append(key)
             elif result.state != "open" and old_state == "open":
-                newly_closed.append((scan["target"], port))
+                newly_closed.append(key)
     return new_open, newly_closed
 
 
@@ -417,7 +553,7 @@ def main():
 
     if args.probe and not args.banners:
         args.banners = True
-        print("[*] --probe implies --banners -- turning banner reads on.")
+        print("[*] --probe implies --banners -- turning banner/TLS reads on.")
 
     if args.gentle:
         args.workers = min(args.workers, 3)
@@ -432,22 +568,13 @@ def main():
             sys.exit(1)
 
     print("=" * 45)
-    print("           NETWORK PORT SCANNER v1.6         ")
+    print("           NETWORK PORT SCANNER v1.7         ")
     print("=" * 45)
 
     try:
-        raw_targets = resolve_targets(args)
+        targets = resolve_targets(args)
     except (ValueError, OSError) as e:
         print(f"\n[-] Error: {e}")
-        sys.exit(1)
-
-    targets = []
-    for raw in raw_targets:
-        cleaned = clean_target(raw)
-        if cleaned:
-            targets.append(cleaned)
-    if not targets:
-        print("\n[-] Error: No valid target provided.")
         sys.exit(1)
 
     try:
@@ -482,6 +609,8 @@ def main():
         extras.append("adaptive-timeout=on")
     if args.banners:
         extras.append("banners=on" + ("+probe" if args.probe else ""))
+    if args.shuffle:
+        extras.append("shuffle=on")
     print(f"[*] {len(ports)} ports | workers={args.workers} | timeout={args.timeout}s"
           + (f" | {' | '.join(extras)}" if extras else ""))
 
@@ -503,35 +632,52 @@ def main():
         if len(resolved) > 1:
             print(f"\n[*] Scanning {target} ({target_ip})")
 
+        scan_ports = list(ports)
+        if args.shuffle:
+            random.shuffle(scan_ports)
+
         adaptive = AdaptiveTimeout(args.timeout) if args.adaptive_timeout else None
 
-        def _scan_one(p, _ip=target_ip, _adaptive=adaptive):
+        def _scan_one(p, _ip=target_ip, _host=target, _adaptive=adaptive):
             current_timeout = _adaptive.get() if _adaptive else args.timeout
-            result = scan_port(_ip, p, current_timeout, args.banners, args.probe)
-            if _adaptive and result.state != "no_response":
+            result = scan_port(_ip, p, current_timeout, args.banners, args.probe, _host)
+            # Only open-port RTTs feed the average (see AdaptiveTimeout docstring).
+            if _adaptive and result.state == "open":
                 _adaptive.update(result.rtt_ms)
             return result
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            results = list(pool.map(_scan_one, ports))
+            raw_results = list(pool.map(_scan_one, scan_ports))
 
-        for port, result in zip(ports, results):
+        # Report in ascending port order regardless of scan order, so
+        # --shuffle changes the wire pattern but not the readability
+        # of the output or the saved report.
+        ordered = sorted(zip(scan_ports, raw_results), key=lambda pair: pair[0])
+        ordered_ports = [p for p, _ in ordered]
+        ordered_results = [r for _, r in ordered]
+
+        for port, result in ordered:
             grand_counts[result.state] += 1
             if result.state == "open":
                 line = (f"[+] Port {port:<5}/TCP : OPEN ({get_service_name(port)}) "
                         f"- {result.rtt_ms:.2f}ms")
+                if result.tls_info:
+                    line += f" [{result.tls_info}]"
                 if result.banner:
                     line += f" | {result.banner}"
                 print(line)
+                if result.advisory:
+                    print(f"    [!] {result.advisory}")
 
         if adaptive:
             summary = adaptive.summary()
             if summary:
                 avg_rtt, final_timeout = summary
                 print(f"    [*] Adaptive timeout settled at {final_timeout:.2f}s "
-                      f"(avg RTT {avg_rtt:.1f}ms)")
+                      f"(avg open-port RTT {avg_rtt:.1f}ms)")
 
-        scans.append({"target": target, "ip": target_ip, "ports": ports, "results": results})
+        scans.append({"target": target, "ip": target_ip,
+                       "ports": ordered_ports, "results": ordered_results})
 
     duration = (datetime.now() - start_time).total_seconds()
     print("-" * 45)
@@ -539,8 +685,10 @@ def main():
           f"{grand_counts['open']} open, {grand_counts['closed']} closed, "
           f"{grand_counts['no_response']} no response.")
 
+    diff_result = None
     if previous_report is not None:
-        new_open, newly_closed = diff_against_previous(previous_report, scans)
+        diff_result = diff_against_previous(previous_report, scans)
+        new_open, newly_closed = diff_result
         print("-" * 45)
         if new_open:
             print(f"[!] {len(new_open)} NEW open port(s) since {args.diff}:")
@@ -557,6 +705,10 @@ def main():
         save_results(args.output, args.csv, run_id, scans)
         fmt = "CSV" if args.csv else "JSON"
         print(f"[*] Results saved to {args.output} ({fmt})")
+
+    if args.md:
+        save_markdown_report(args.md, run_id, scans, duration, diff_result)
+        print(f"[*] Markdown report saved to {args.md}")
 
 
 if __name__ == "__main__":
