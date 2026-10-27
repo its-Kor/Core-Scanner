@@ -1,2 +1,3 @@
-requests
-colorama
+# Core-Scanner v1.7
+# Python standard library only.
+# No third-party runtime dependencies are required.

@@ -1,124 +1,148 @@
-# Core-Scanner
+# Core-Scanner v1.7
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)
-![Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)
-![Version](https://img.shields.io/badge/release-v1.7-orange.svg)
-![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](#requirements)
+[![Standard library](https://img.shields.io/badge/dependencies-stdlib-green.svg)](#requirements)
+[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
 
-A dependency-free TCP port scanner and service surface auditor built entirely on the **Python standard library**, focused on honest socket states, TLS inspection, operator safety, and structured reporting.
+A CLI tool for observing TCP ports and service exposure on systems **under explicit authorization**. It supports optional banner/TLS inspection and JSON, CSV, and Markdown reporting, with no external runtime dependencies.
+
+## Requirements
+
+- Python 3.8 or later, as specified by the project's compatibility contract. The test suite for this release was run on **Python 3.13.5 / Linux**. The full 102-test suite also passed on **Python 3.15 / Windows 11**.
+- Python standard library only; `requirements.txt` lists no installation dependencies.
+- `uv` is optional for selecting a Python interpreter and running the CLI. The code also works directly with `python`.
+- Documented authorization for all targets being assessed. Do not use public domains as demonstration targets without permission.
+
+## Project Structure
 
 ```text
-=============================================
-           NETWORK PORT SCANNER v1.7         
-=============================================
-
-[*] Run a1b2c3d4 at 2026-10-18 14:30:00 UTC
-[*] Target: example.com (93.184.216.34)
-[*] 100 ports | workers=20 | timeout=1.0s | banners=on+probe
-
-[+] Port 22   /TCP : OPEN (ssh)   - 18.40ms | SSH-2.0-OpenSSH_8.9p1 Ubuntu-3
-[+] Port 80   /TCP : OPEN (http)  - 17.92ms | HTTP/1.1 301 Moved Permanently
-[+] Port 443  /TCP : OPEN (https) - 18.15ms [TLSv1.3/TLS_AES_256_GCM_SHA384] | HTTP/1.1 200 OK
-[+] Port 6379 /TCP : OPEN (unknown) - 19.04ms
-    [!] Redis exposed: verify 'protected-mode' and 'requirepass'.
----------------------------------------------
-[*] Scan completed in 1.42s! 4 open, 94 closed, 2 no response.
+Core-Scanner/
+├── main.py                  # entry point and backward-compatible public facade
+├── core_scanner/
+│   ├── __init__.py
+│   ├── config.py            # port, timeout, and resource-limit constants
+│   ├── models.py            # ScanResult, DiffResult, cancellation exceptions
+│   ├── targets.py           # parsing, CIDR, validation, DNS after consent
+│   ├── network.py           # TCP sockets, TLS, banners, connection states
+│   ├── scheduler.py         # ThreadPoolExecutor with a bounded task window
+│   ├── baseline.py          # JSON loading/validation, conservative diff
+│   ├── reports.py           # JSON, CSV, Markdown, sanitization, safe writes
+│   └── cli.py               # argparse and target/port selection
+├── tests/
+│   ├── test_main.py         # 88 regression tests preserved from Phase 3
+│   └── test_architecture.py # additional architecture/contract tests
+├── README.md
+├── requirements.txt
+├── .gitignore
+└── LICENSE
 ```
 
----
+`main.py` **deliberately retains CLI orchestration**: existing consumers and tests use `mock.patch.object(main, "scan_port" / "parse_args" / "resolve_address" / "scan_ports_bounded" / "save_results", ...)`. Simply re-exporting these names would not preserve call-site bindings if orchestration were imported from another module. The implementation is therefore split into modules, while its integration points remain patchable through `main` without circular imports.
 
-## Key Features
+**Dependencies between modules** (arrows indicate which module imports which):
 
-* **Core Scanning Engine**
-  * **100% Standard Library:** Zero external dependencies (`pip install` is never required).
-  * **Honest Socket States:** Distinguishes between `open`, `closed` (`ECONNREFUSED`), and `no_response` (filtered/timeout), recording per-port RTT in milliseconds (`rtt_ms`).
-  * **Adaptive Timeout & Gentle Mode:** Dynamically shrinks timeouts toward observed open-port RTTs (`--adaptive-timeout`), or throttles concurrency for sensitive networks (`--gentle`, `--shuffle`).
-  * **Batch & CIDR Expansion:** Accepts single hosts, URLs, CIDR blocks (`192.168.1.0/28` capped at 1,024 hosts for safety), or target lists (`-i`).
-
-* **Service & TLS Inspection**
-  * **Passive Banner Grabbing (`--banners`):** Read-only capture of spontaneous service greetings (SSH, FTP, SMTP) without sending extra packets.
-  * **Real TLS Handshake:** Negotiates TLS on encrypted ports (`443`, `8443`, `993`, etc.) to report the exact protocol version and cipher suite (`TLSv1.3/TLS_AES_256_GCM_SHA384`).
-  * **TLS-Safe Active Probing (`--probe`):** Coaxes quiet services (HTTP, Redis, SMTP) with minimal stdlib payloads—sent *after* the TLS handshake on encrypted ports.
-  * **Passive Hardening Advisories:** Automatically flags commonly exposed risk ports (Telnet, SMB, unencrypted Docker socket, Redis, databases) with triage notes.
-
-* **Reporting & Baseline Auditing**
-  * **Multi-Format Export:** Outputs flat, append-friendly records to **JSON**, **CSV** (`--csv`), and human-readable **Markdown** (`--md`).
-  * **Baseline Diffing (`--diff`):** Compares current results against a previous JSON report to highlight newly opened (`+`) or newly closed (`-`) ports.
-
----
-
-## Quick Start
-
-```bash
-# 1. Interactive mode or default quick scan (15 common ports)
-python3 main.py -t 192.168.1.10
-
-# 2. Scan top 100 ports with TLS inspection, active probing, and adaptive timeout
-python3 main.py -t example.com --top-100 --probe --adaptive-timeout -y
-
-# 3. Scan a CIDR subnet or target file in randomized order and export a Markdown report
-python3 main.py -t 192.168.1.0/28 --top-100 --shuffle -y --md report.md
-python3 main.py -i targets.txt --top-100 -y -o baseline.json
-
-# 4. Compare today's surface against a previous baseline report
-python3 main.py -t example.com --top-100 -y --diff baseline.json
+```text
+main -> cli, targets, network, scheduler, reports, baseline, models, config
+cli -> targets, config
+network -> models, config
+scheduler -> models, config
+targets -> config
+reports -> baseline, config
+baseline -> models, config
+models, config -> standard library
 ```
 
----
+## Running the Scanner (PowerShell / Windows 11)
+
+From the repository root, using Python managed by uv:
+
+```powershell
+uv python find
+uv run --no-project --offline python -B main.py --help
+uv run --no-project --offline python -B -m unittest discover -s tests -v
+```
+
+Without uv, after selecting a compatible Python interpreter:
+
+```powershell
+python -B main.py --help
+python -B -m unittest discover -s tests -v
+```
+
+With **authorization** for the laboratory targets, local examples:
+
+```powershell
+# No active probes; prompts for authorization interactively
+uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 22,80,443
+
+# IPv6 loopback, explicit ports, no banner collection
+uv run --no-project --offline python -B main.py -t ::1 -p 80,443
+
+# New reports: destination files must NOT already exist; JSON + Markdown
+uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 -o baseline.json --md summary.md
+
+# Compare with a valid baseline; preserve the original scope
+uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 --diff baseline.json
+```
+
+`-y / --yes` only skips the prompt; it **does not constitute proof of authorization**. Project policy requires consent before DNS resolution, either collected through the interactive CLI or affirmed by the operator with `-y`.
 
 ## CLI Options
 
-| Flag | Description |
-| :--- | :--- |
-| `-t`, `--target` | IP, domain, URL, or CIDR block to scan (prompts interactively if omitted) |
-| `-i`, `--input-file` | File with one target per line (hosts, URLs, or CIDR blocks; `#` comments supported) |
-| `-p`, `--ports` | Custom ports/ranges, e.g. `22,80,443` or `1-1024` |
-| `--top-100` | Scan a curated list of 100 commonly exposed TCP ports |
-| `--top-1000` | Scan IANA well-known ports `1-1000` |
-| `--timeout` | Socket timeout ceiling in seconds (default: `1.0`) |
-| `-w`, `--workers` | Concurrent worker threads, `1-100` (default: `20`) |
-| `--gentle` | Low-impact profile: caps workers at `3` and extends timeout to `>= 2.0s` |
-| `--shuffle` | Randomize port scan order on the wire (output remains sorted ascending) |
-| `--adaptive-timeout` | Shrink timeout toward the rolling average RTT of `open` ports |
-| `--banners` | Passively read service banners and perform TLS version/cipher inspection |
-| `--probe`, `--active` | Send minimal protocol-specific probe when passive read is empty (implies `--banners`) |
-| `-o`, `--output` | Write scan results to disk (JSON by default) |
-| `--csv` | Format `-o` output as CSV instead of JSON |
-| `--md` | Generate a human-readable Markdown assessment report |
-| `--diff` | Compare current scan against a previous JSON report (`-o`) |
-| `-y`, `--yes` | Skip the interactive authorization confirmation prompt |
+| Option | Behavior |
+| --- | --- |
+| `-t`, `--target` / `-i`, `--input-file` | IP/hostname/URL/CIDR target or UTF-8 target list (mutually exclusive) |
+| `-p`, `--ports` / `--top-100` / `--top-1000` | Custom ports, curated set, or ports 1–1000 (mutually exclusive) |
+| `--timeout`, `-w`, `--workers` | TCP timeout (0.2–30 s), workers (1–100) |
+| `--gentle`, `--shuffle`, `--adaptive-timeout` | Reduced-concurrency profile, randomized order, adaptive timeout reduction |
+| `--banners`, `--probe` (`--active`) | Passive banner/TLS inspection; optional, bounded active probing |
+| `-o`, `--output`, `--csv`, `--md` | JSON/CSV and Markdown reports |
+| `--diff` | Compare against a previous JSON report using conservative state transitions |
+| `-y`, `--yes` | Skip the prompt after local validation and before DNS resolution |
 
----
+**Scope limits:** 1,024 addresses per CIDR, 1,024 unique targets per run, 4,096 ports, and 262,144 target–port combinations; target files are limited to 1 MiB and 8,192 lines. Hostnames are normalized using IDNA; IPv6 is supported; IPv6 zone identifiers are not accepted. Ports embedded in URLs do not override `--ports`.
 
-## Architecture & Scope Decisions
+## Reports and Baseline Diff
 
-* **Zero Third-Party Dependencies:** `python-nmap` and external libraries are deliberately excluded so the scanner runs on any clean Python 3.8+ environment.
-* **No Hand-Rolled ASN.1 Parser:** Rather than maintaining a fragile custom DER parser for X.509 certificates under `CERT_NONE`, the scanner reliably reports negotiated TLS versions/ciphers and delegates deep certificate chain auditing to dedicated tools (`openssl x509`, `testssl.sh`, `sslyze`).
+- **JSON:** fields `run_id`, `target`, `ip`, `port`, `state`, `service`, `rtt_ms`, `tls_info`, `banner`, and `advisory`; the original banner is retained with safe JSON escaping. Previously generated valid v1.7 reports remain supported.
+- **CSV:** potentially formula-interpreted prefixes are neutralized; dangerous control characters receive a literal representation. Exercise additional care when opening reports in external applications.
+- **Markdown/terminal:** ANSI sequences, control characters, and presentation syntax from service-provided content are neutralized; structured data is not altered by this formatting.
+- **Previous JSON reports:** structural and type validation, duplicate detection, a 256 MiB size limit, a 262,144-record limit, and a maximum nesting depth of 16.
+- **Diff:** `closed -> open` and `open -> closed` are confirmed transitions; differing states involving `no_response`, `error`, or `unknown` produce inconclusive comparisons. An `open` port absent from the baseline is a **first observation**, not proof that it has recently opened. Ports that were not scanned are not reported as closed.
+- **No overwriting:** existing destination files must not be overwritten. Publication through a temporary file and an exclusive hardlink (`os.link`) depends on filesystem support. Separate JSON and Markdown outputs do not form a single transaction. Review destination paths and permissions before running, especially on NTFS volumes or network shares.
 
----
+## Concurrency and TLS Inspection
 
-## Roadmap (v1.8)
+The task window (`ThreadPoolExecutor.submit` + `wait`) maintains at most `2 × workers` submitted futures per target at any time, with backpressure and cooperative cancellation. `Ctrl+C` during a scan prevents incomplete results from being published (exit code `130`); unexpected worker exceptions result in exit code `1`. Blocked socket operations finish within their applicable timeouts, not instantaneously.
 
-- [ ] **Banner & report sanitization** — strip ANSI escapes/control bytes; escape backticks in `--md` and formula prefixes (`=`, `+`, `-`, `@`) in `--csv`
-- [ ] **Fail-fast output check** — validate that `-o` and `--md` directories exist and are writable before scanning
-- [ ] **TLS handshake timeout cap** — apply `BANNER_TIMEOUT` before `wrap_socket()` so non-TLS ports never stall for the full `--timeout`
-- [ ] **Richer protocol parsing** — HTTP `Host:` header, `Location:` redirects, and `<title>`; passive MySQL version decoding; Redis `PING` probe
-- [ ] **Opportunistic TLS fallback** — retry with a TLS handshake when `--probe` gets no plaintext reply on non-standard ports
-- [ ] **Smart CIDR & port handling** — exclude `.0`/`.255` on IPv4 subnets `< /31` and preserve explicit ports passed via `-t host:port`
-- [ ] **Dual-stack IPv4/IPv6** — resolve targets via `getaddrinfo()` with automatic `AF_INET` / `AF_INET6` socket selection
-- [ ] **Targeted retries (`--retries`)** — retry only `no_response` ports on lossy/VPN links without re-probing `open` or `closed` ports
-- [ ] **Instant `Ctrl+C` & scope-aware `--diff`** — cancel queued worker futures immediately on interrupt and ignore untested baseline ports in `--diff`
+TCP timeout: `--timeout`; TLS handshake: 1 s; banner/probe: 0.75 s per operation or the probe's shared deadline. Duration measurements use a monotonic clock. TLS negotiation intentionally uses `CERT_NONE` to observe encryption on services with self-signed or expired certificates; it **does not validate certificates or server identity**. Only configured direct-TLS ports receive a handshake; automatic STARTTLS is not supported.
 
----
+`no_response` indicates a timeout or a known reachability error; `closed` means a confirmed refusal; `error` covers unclassified error codes; and `open` means the TCP connection was accepted. TLS failure does not change an observed TCP `open` state. Synchronous DNS resolution still depends on the operating system's resolver.
 
-## Testing & Responsible Use
+## Development, Compatibility, and Testing
 
-Run the unit test suite using standard library `unittest`:
-```bash
-python3 test_main.py
+Run the tests **without public targets**:
+
+```powershell
+uv run --no-project --offline python -B -m unittest discover -s tests -v
+uv run --no-project --offline python -B main.py --help
+python -B -m compileall -q .
+git status --short
+git diff --check
 ```
 
-> **Warning:** Only scan systems you own or have explicit, written authorization to test.
+The tests use mocks, import subprocesses, and controlled loopback connections. The architecture preserves `main.ScanResult` (five fields), `main.DiffResult` (historical tuple-unpacking behavior), CLI signatures, and substitutions made with `mock.patch.object(main, ...)`. `main.scan_port` and `main.load_previous_report` have explicit wrappers that forward local changes to `TLS_PORTS` and JSON limits in tests. Importing modules does not request input, perform DNS resolution, or start a scan.
+
+**Compatibility caveat:** `__module__` values and the defining locations of data contracts changed when the modules were extracted. Newly pickled objects may require the new structure and may not be loadable by older code; backward compatibility of serialized Python objects is not guaranteed. Existing valid **JSON** contracts remain supported.
+
+Contributions: preserve CLI/JSON contracts and resource limits; add a regression test for each change; run all tests before committing; review staged files for secrets; and make commits manually. Do not use `reset`, `rebase`, force pushes, or authorship changes without a deliberate decision.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The license file and author identity have been preserved.
+
+
+---
 
 <div align="center">
   
