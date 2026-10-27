@@ -62,7 +62,9 @@ class TargetParsingTests(unittest.TestCase):
             "example.com?x=y", "https://", "https://name:bad/",
             "https://user:secret@example.com/", "[::1", "example.com:0",
             "example.com:", "exa mple.com", "::1%eth0", "example..com",
-            "http://[notanip]/", "a" * (main.MAX_TARGET_ENTRY_LENGTH + 1),
+            "http://[notanip]/", "http://[::1]garbage/",
+            "http://[127.0.0.1]/",
+            "a" * (main.MAX_TARGET_ENTRY_LENGTH + 1),
         )
         for target in invalid:
             with self.subTest(target=target[:40]):

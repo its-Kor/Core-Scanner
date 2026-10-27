@@ -72,6 +72,17 @@ def _parse_single_target(raw):
 
     if not parsed.netloc or parsed.username is not None or parsed.password is not None:
         raise ValueError("URL requires a host and must not contain credentials")
+
+    # Explicit validation across Python versions, including Python 3.8.
+    if "[" in parsed.netloc or "]" in parsed.netloc:
+        match = re.fullmatch(r"\[([^][]+)\](?::[0-9]*)?", parsed.netloc)
+        if match is None:
+            raise ValueError("invalid bracketed IPv6 authority")
+        try:
+            ipaddress.IPv6Address(match.group(1))
+        except ValueError as exc:
+            raise ValueError("invalid bracketed IPv6 address") from exc
+
     try:
         host = parsed.hostname
         port = parsed.port
