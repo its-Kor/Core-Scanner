@@ -57,3 +57,7 @@ Desktop.ini
 # Scanner outputs (optional local directory)
 # Store private scan results here
 /scan-results/
+
+# Legacy report locations used in earlier documentation
+/baseline.json
+/summary.md

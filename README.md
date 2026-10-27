@@ -78,11 +78,15 @@ uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 22,80,443
 # IPv6 loopback, explicit ports, no banner collection
 uv run --no-project --offline python -B main.py -t ::1 -p 80,443
 
+# Keep scan results in a local directory ignored by Git.
+# Reports may contain IP addresses, open ports, and service banners.
+New-Item -ItemType Directory -Force -Path scan-results | Out-Null
+
 # New reports: destination files must NOT already exist; JSON + Markdown
-uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 -o baseline.json --md summary.md
+uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 -o scan-results/baseline.json --md scan-results/summary.md
 
 # Compare with a valid baseline; preserve the original scope
-uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 --diff baseline.json
+uv run --no-project --offline python -B main.py -t 127.0.0.1 -p 80 --diff scan-results/baseline.json
 ```
 
 `-y / --yes` only skips the prompt; it **does not constitute proof of authorization**. Project policy requires consent before DNS resolution, either collected through the interactive CLI or affirmed by the operator with `-y`.
