@@ -1,10 +1,63 @@
-# Cache do Python
+
+# ==========================================
+# Core-Scanner - Git Ignore Rules
+# ==========================================
+
+# Python bytecode and cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Configurações do VS Code
-.vscode/
-
-# Ambientes virtuais (caso venha a usar no futuro)
+# Virtual environments
+.venv/
 venv/
 env/
+ENV/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+
+# Testing and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# VS Code
+.vscode/
+
+# Temporary files and logs
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Scanner outputs (optional local directory)
+# Store private scan results here
+/scan-results/
+
+# Legacy report locations used in earlier documentation
+/baseline.json
+/summary.md
