@@ -943,10 +943,14 @@ class NetworkPhase3Tests(unittest.TestCase):
             except OSError as exc:
                 failures.append(type(exc).__name__)
 
+        # Windows may spend time loading system CA certificates.
+        # Keep SSL context setup outside the TLS handshake timing.
+        tls_context = ssl.create_default_context()
         server_thread = threading.Thread(target=server)
         server_thread.start()
         try:
-            with mock.patch.object(main, "TLS_PORTS", {listener.getsockname()[1]}):
+            with mock.patch.object(ssl, "create_default_context", return_value=tls_context), \
+                 mock.patch.object(main, "TLS_PORTS", {listener.getsockname()[1]}):
                 start = time.perf_counter()
                 result = main.scan_port("127.0.0.1", listener.getsockname()[1],
                                         timeout=0.5, grab_banner=True)
